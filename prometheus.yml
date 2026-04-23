@@ -1,0 +1,32 @@
+# my global config
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          app: "prometheus"
+
+  - job_name: "jenkins"
+    metrics_path: /prometheus/
+    basic_auth:
+      username: admin
+      password: admin
+    static_configs:
+      # O Jenkins roda no mesmo docker compose. O acesso pelo nome do serviço
+      # evita dependência do host da VM, e o basic_auth permite o scrape do
+      # endpoint autenticado sem abrir leitura anônima no Jenkins.
+      - targets: ["jenkins:8080"]
