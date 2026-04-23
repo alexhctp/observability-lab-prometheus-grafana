@@ -1,0 +1,157 @@
+FROM jenkins/jenkins:latest-jdk21
+
+USER root
+
+# Instala somente o necessario para resolver e baixar plugins por HTTPS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl python3 \
+        && update-ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+# Importa a cadeia de certificados HTTPS para o truststore do sistema e do Java.
+# Isso substitui bypasses de SSL e permite validacao correta no build e no runtime.
+RUN set -euo pipefail; \
+    mkdir -p /tmp/cert-fetch && cd /tmp/cert-fetch; \
+    for host in updates.jenkins.io mirrors.jenkins.io; do \
+        openssl s_client -showcerts -verify 5 -connect "$host:443" < /dev/null \
+        | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{ if(/BEGIN CERTIFICATE/){a++}; out="cert"a".pem"; print >out}'; \
+        if ls ./*.pem >/dev/null 2>&1; then \
+            for cert in ./*.pem; do \
+                newname=$(openssl x509 -noout -subject -in "$cert" | sed -nE 's/.*CN ?= ?(.*)/\1/; s/[ ,.*]/_/g; s/__/_/g; s/_-_/-/; s/^_//g;p' | tr '[:upper:]' '[:lower:]').crt; \
+                test -n "$newname"; \
+                mv "$cert" "$newname"; \
+            done; \
+        fi; \
+        if ls ./*.crt >/dev/null 2>&1; then \
+            for crt in ./*.crt; do \
+                crt_base=$(basename "$crt"); \
+                cp -f "$crt" "/usr/local/share/ca-certificates/${host}-${crt_base}"; \
+                alias_name="jenkins-${host}-${crt_base%.crt}"; \
+                keytool -delete -alias "$alias_name" -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit >/dev/null 2>&1 || true; \
+                keytool -importcert -noprompt -trustcacerts -alias "$alias_name" -file "$crt" -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit; \
+            done; \
+        fi; \
+        rm -f ./*.crt ./*.pem; \
+    done; \
+    update-ca-certificates; \
+    rm -rf /tmp/cert-fetch
+
+# Baixa o plugin Prometheus e suas dependencias obrigatorias com versoes
+# compativeis com o core atual do Jenkins do lab, evitando carregar plugins
+# "latest" que exigem um core mais novo e quebram a inicializacao.
+RUN mkdir -p /usr/share/jenkins/ref/plugins \
+        && python3 - <<'PY'
+import json
+import os
+import urllib.request
+from collections import OrderedDict
+
+REQUESTED_PLUGINS = (
+    # Default Jenkins suggested plugins (setup wizard)
+    'cloudbees-folder',
+    'antisamy-markup-formatter',
+    'build-timeout',
+    'credentials-binding',
+    'timestamper',
+    'ws-cleanup',
+    'ant',
+    'gradle',
+    'workflow-aggregator',
+    'github-branch-source',
+    'pipeline-github-lib',
+    'pipeline-graph-view',
+    'git',
+    'github',
+    'ssh-slaves',
+    'matrix-auth',
+    'ldap',
+    'email-ext',
+    'mailer',
+    'dark-theme',
+    # Observability
+    'prometheus',
+)
+CATALOG_URL = 'https://updates.jenkins.io/current/plugin-versions.json'
+PLUGIN_ROOT = '/usr/share/jenkins/ref/plugins'
+def parse_core(version):
+    parts = []
+    for piece in version.split('.'):
+        digits = ''.join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+core_version_str = os.popen('java -jar /usr/share/jenkins/jenkins.war --version').read().strip()
+CORE_VERSION = parse_core(core_version_str)
+
+
+with urllib.request.urlopen(CATALOG_URL, timeout=30) as response:
+    catalog = json.load(response)['plugins']
+
+
+resolved = OrderedDict()
+
+
+def require_compatible(plugin_name, version):
+    metadata = catalog[plugin_name][version]
+    required_core = metadata.get('requiredCore')
+    if required_core and parse_core(required_core) > CORE_VERSION:
+        raise RuntimeError(
+            f'{plugin_name}:{version} requires Jenkins {required_core}, current core is {core_version_str}'
+        )
+    return metadata
+
+
+def select_latest_compatible(plugin_name):
+    compatible = []
+    for version, metadata in catalog[plugin_name].items():
+        required_core = metadata.get('requiredCore')
+        if required_core and parse_core(required_core) <= CORE_VERSION:
+            compatible.append((metadata['releaseTimestamp'], version, metadata))
+    if not compatible:
+        raise RuntimeError(f'No compatible version found for {plugin_name}')
+    compatible.sort()
+    _, version, metadata = compatible[-1]
+    return version, metadata
+
+
+def is_newer(plugin_name, candidate_version, current_version):
+    candidate = catalog[plugin_name][candidate_version]['releaseTimestamp']
+    current = catalog[plugin_name][current_version]['releaseTimestamp']
+    return candidate > current
+
+
+pending = []
+
+
+def enqueue(plugin_name, version=None):
+    if version is None:
+        version, _ = select_latest_compatible(plugin_name)
+    pending.append((plugin_name, version))
+
+
+for plugin_name in REQUESTED_PLUGINS:
+    enqueue(plugin_name)
+
+while pending:
+    plugin_name, version = pending.pop()
+    metadata = require_compatible(plugin_name, version)
+    current = resolved.get(plugin_name)
+    if current and not is_newer(plugin_name, version, current[0]):
+        continue
+
+    resolved[plugin_name] = (version, metadata)
+    for dependency in metadata.get('dependencies', []):
+        if not dependency.get('optional', False):
+            enqueue(dependency['name'], dependency['version'])
+
+for plugin_name, (_, metadata) in resolved.items():
+    destination = os.path.join(PLUGIN_ROOT, f'{plugin_name}.jpi')
+    with urllib.request.urlopen(metadata['url'], timeout=30) as response:
+        with open(destination, 'wb') as plugin_file:
+            plugin_file.write(response.read())
+PY
+
+RUN chown -R jenkins:jenkins /usr/share/jenkins/ref/plugins
